@@ -15,7 +15,7 @@ GT_UI_INIT = function()
     GT_UI_frame=nil
   end
   local f=CreateFrame("Frame",nil,UIParent)
-  f:SetSize(280,180)
+  f:SetSize(230,44)
   f:SetPoint("TOPLEFT",UIParent,"TOPLEFT",12,-12)
   f:SetMovable(true)
   f:EnableMouse(true)
@@ -26,12 +26,11 @@ GT_UI_INIT = function()
   f:SetBackdrop({bgFile="Interface\\Buttons\\WHITE8X8",edgeFile="Interface\\Buttons\\WHITE8X8",tile=true,tileSize=8,edgeSize=1,insets={left=2,right=2,top=2,bottom=2}})
   f:SetBackdropColor(0,0,0,0.72)
   f:SetBackdropBorderColor(0.6,0.5,0,0.8)
-  f.ver=2
 
   local healf=CreateFrame("CheckButton",nil,f,"UICheckButtonTemplate")
   healf:SetSize(24,24)
-  healf:SetPoint("TOPLEFT",10,-8)
-  healf:SetHitRectInsets(0,-70,0,0)
+  healf:SetPoint("TOPLEFT",8,-8)
+  healf:SetHitRectInsets(0,-40,0,0)
   healf:SetScript("OnClick",function(self)
     GT_ON=not GT_ON
     self:SetChecked(GT_ON==true)
@@ -42,8 +41,8 @@ GT_UI_INIT = function()
 
   local bufff=CreateFrame("CheckButton",nil,f,"UICheckButtonTemplate")
   bufff:SetSize(24,24)
-  bufff:SetPoint("LEFT",healf,"RIGHT",80,0)
-  bufff:SetHitRectInsets(0,-60,0,0)
+  bufff:SetPoint("LEFT",hl,"RIGHT",10,0)
+  bufff:SetHitRectInsets(0,-40,0,0)
   bufff:SetScript("OnClick",function(self)
     GT_BUFF=not GT_BUFF
     self:SetChecked(GT_BUFF==true)
@@ -52,31 +51,39 @@ GT_UI_INIT = function()
   bl:SetPoint("LEFT",bufff,"RIGHT",4,0)
   bl:SetText("Бафы")
 
-  local t=f:CreateFontString(nil,"OVERLAY","GameFontNormal")
-  t:SetPoint("TOPLEFT",f,"TOPLEFT",10,-40)
-  t:SetPoint("BOTTOMRIGHT",f,"BOTTOMRIGHT",-10,6)
-  t:SetJustifyH("LEFT")
-  t:SetJustifyV("TOP")
-  f.text=t
+  local formf=CreateFrame("CheckButton",nil,f,"UICheckButtonTemplate")
+  formf:SetSize(24,24)
+  formf:SetPoint("LEFT",bl,"RIGHT",10,0)
+  formf:SetHitRectInsets(0,-40,0,0)
+  formf:SetScript("OnClick",function(self)
+    GT_FORM=not GT_FORM
+    self:SetChecked(GT_FORM==true)
+  end)
+  local fl=formf:CreateFontString(nil,"OVERLAY","GameFontNormal")
+  fl:SetPoint("LEFT",formf,"RIGHT",4,0)
+  fl:SetText("Облик")
+
   GT_UI_frame=f
   GT_heal=healf
   GT_buff=bufff
+  GT_formchk=formf
   GT_ON=true
   GT_BUFF=true
+  GT_FORM=true
   GT_LASTUP=GetTime()
   healf:SetChecked(true)
   bufff:SetChecked(true)
+  formf:SetChecked(true)
   f:SetScript("OnUpdate",function(self)
     if GetTime()-GT_LASTUP>3 then self:Hide() end
   end)
-  t:SetText("HealBot: START")
 end
 GT_UI_INIT()
 `
 
 // UIDestroy убирает фрейм и чекбоксы из клиента.
 func UIDestroy(h *hook.Hook) error {
-	return h.Do(`if GT_UI_frame then GT_UI_frame:Hide() GT_UI_frame:SetParent(nil) GT_UI_frame=nil end GT_heal=nil GT_buff=nil`)
+	return h.Do(`if GT_UI_frame then GT_UI_frame:Hide() GT_UI_frame:SetParent(nil) GT_UI_frame=nil end GT_heal=nil GT_buff=nil GT_formchk=nil`)
 }
 
 // UIInit создаёт окно с чекбоксами в игре (идемпотентно).
@@ -84,9 +91,9 @@ func UIInit(h *hook.Hook) error {
 	return h.Do(uiInitLua)
 }
 
-// UIUpdate синхронизирует чекбоксы с переменными и обновляет текст фрейма.
-func UIUpdate(h *hook.Hook, text string) error {
-	return h.Do(fmt.Sprintf(`GT_LASTUP=GetTime() if GT_heal then GT_heal:SetChecked(GT_ON==true) end if GT_buff then GT_buff:SetChecked(GT_BUFF==true) end GT_TXT=[==[%s]==] local f=GT_UI_frame if f then f.text:SetText(GT_TXT) end`, text))
+// UIUpdate синхронизирует чекбоксы с переменными (без текстовой панели).
+func UIUpdate(h *hook.Hook) error {
+	return h.Do(`GT_LASTUP=GetTime() if GT_heal then GT_heal:SetChecked(GT_ON==true) end if GT_buff then GT_buff:SetChecked(GT_BUFF==true) end if GT_formchk then GT_formchk:SetChecked(GT_FORM==true) end`)
 }
 
 // UnitHasBuff проверяет наличие бафа по иконке спелла на юните.
@@ -114,22 +121,27 @@ end)(%d)`, unit, spellID)
 	return v == "true", nil
 }
 
-// UIState возвращает состояние чекбоксов (Хил, Бафы).
-func UIState(h *hook.Hook) (heal, buff bool, err error) {
-	heal, buff = true, true
-	if err = h.Do(`GT_V=tostring(GT_ON==true).."#"..tostring(GT_BUFF==true)`); err != nil {
-		return heal, buff, err
+// UIState возвращает состояние чекбоксов (Хил, Бафы, Облик).
+func UIState(h *hook.Hook) (heal, buff, form bool, err error) {
+	heal, buff, form = true, true, true
+	if err = h.Do(`GT_V=tostring(GT_ON==true).."#"..tostring(GT_BUFF==true).."#"..tostring(GT_FORM==true)`); err != nil {
+		return heal, buff, form, err
 	}
 	v, gerr := h.Get("GT_V")
 	if gerr != nil {
-		return heal, buff, gerr
+		return heal, buff, form, gerr
 	}
 	parts := strings.Split(v, "#")
-	heal = strings.TrimSpace(parts[0]) == "true"
+	if len(parts) > 0 {
+		heal = strings.TrimSpace(parts[0]) == "true"
+	}
 	if len(parts) > 1 {
 		buff = strings.TrimSpace(parts[1]) == "true"
 	}
-	return heal, buff, nil
+	if len(parts) > 2 {
+		form = strings.TrimSpace(parts[2]) == "true"
+	}
+	return heal, buff, form, nil
 }
 
 // BuffMissing возвращает юнитов без бафа, соответствующего иконке спелла.

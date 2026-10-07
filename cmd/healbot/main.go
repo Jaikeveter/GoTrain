@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -144,13 +143,11 @@ func main() {
 	lastErr := error(nil)
 	uiInited := false
 	uiInitAt := time.Now()
-	lastCastLine := ""
+	uiOn, uiBuff, uiForm := true, true, true
 	lastBuffCheck := time.Now()
 	casts := map[int]int{}
 	lastTrinket := time.Time{}
 	trinketSlot := 13
-
-	_ = game.UIInit(h)
 
 	if *selftest {
 		runSelfTest(h, &lastCast)
@@ -198,19 +195,18 @@ func main() {
 
 		now := time.Now()
 
-		if !uiInited && now.Sub(uiInitAt) > 2*time.Second {
+		if !uiInited && time.Since(uiInitAt) > 100*time.Millisecond {
 			if err := game.UIInit(h); err == nil {
 				uiInited = true
 			} else {
 				uiInitAt = now
 			}
-		}
-
-		uiOn, uiBuff := true, true
-		if uiInited && time.Since(lastUI) > 500*time.Millisecond {
-			uiOn, uiBuff, _ = game.UIState(h)
-			lastUI = time.Now()
-			_ = game.UIUpdate(h, makeUI(st, lastCastLine, uiOn, uiBuff, hotUntil, casts))
+		} else if uiInited && time.Since(lastUI) > 500*time.Millisecond {
+			if on, buff, form, err := game.UIState(h); err == nil {
+				uiOn, uiBuff, uiForm = on, buff, form
+			}
+			lastUI = now
+			_ = game.UIUpdate(h)
 		}
 
 		if !uiOn && !uiBuff {
@@ -222,11 +218,21 @@ func main() {
 			time.Sleep(*tick)
 			continue
 		}
-		if st.Form != 0 && !(*treeOn && st.Form == treeForm) {
-			_ = h.Do(`CancelShapeshiftForm()`)
-			fmt.Printf("%s выхожу из формы %d\n", ts(), st.Form)
-			time.Sleep(*tick)
-			continue
+		if st.Form != 0 {
+			treeOK := *treeOn && st.Form == treeForm
+			if treeOK {
+				// в tree-форме можно продолжать хилиться
+			} else if uiForm {
+				_ = h.Do(`CancelShapeshiftForm()`)
+				fmt.Printf("%s выхожу из формы %d (uiForm=%v)\n", ts(), st.Form, uiForm)
+				time.Sleep(*tick)
+				continue
+			} else {
+				// чекбокс «Облик» снят — форму не трогаем, хилы пропускаем
+				fmt.Printf("%s форма %d сохранена (uiForm=%v)\n", ts(), st.Form, uiForm)
+				time.Sleep(*tick)
+				continue
+			}
 		}
 
 		if uiOn && st.ManaPct() < *manaLow && now.Sub(lastCast) > *gcdF {
@@ -235,7 +241,6 @@ func main() {
 				continue
 			}
 			if cast(h, "player", innervate, &lastCast, 0, false) {
-				lastCastLine = "Innervate -> player"
 				casts[innervate]++
 			} else {
 				skippedUntil[innervate] = now.Add(10 * time.Minute)
@@ -280,7 +285,6 @@ func main() {
 						if spell == swiftmend {
 							delete(hotUntil, best.ID)
 						}
-						lastCastLine = fmt.Sprintf("%s -> %s (hp %d%%)", spellNames[spell], best.ID, int(pct))
 						casts[spell]++
 						didCast = true
 					} else {
@@ -295,7 +299,6 @@ func main() {
 					if v, ok := skippedUntil[barkID]; ok && now.Before(v) {
 						didCast = false
 					} else if castBuff(h, "player", barkID, &lastCast) {
-						lastCastLine = "Barkskin -> player"
 						casts[barkID]++
 						didCast = true
 					} else {
@@ -309,7 +312,6 @@ func main() {
 			if v, ok := skippedUntil[treeID]; ok && now.Before(v) {
 				// пропуск
 			} else if cast(h, "player", treeID, &lastCast, -1, false) {
-				lastCastLine = "Tree of Life"
 				casts[treeID]++
 				didCast = true
 			} else {
@@ -328,7 +330,6 @@ func main() {
 					continue
 				}
 				if cast(h, units[0], id, &lastCast, -1, false) {
-					lastCastLine = spellNames[id] + " -> " + units[0]
 					casts[id]++
 				} else {
 					skippedUntil[id] = now.Add(10 * time.Minute)
@@ -366,41 +367,6 @@ func hotBudgetOK(m map[string]time.Time, cap int) bool {
 		}
 	}
 	return n < cap
-}
-
-func makeUI(st *game.State, lastCastLine string, on, buff bool, hot map[string]time.Time, casts map[int]int) string {
-	var b strings.Builder
-	hs := "ON"
-	if !on {
-		hs = "OFF"
-	}
-	bs := "ON"
-	if !buff {
-		bs = "OFF"
-	}
-	fmt.Fprintf(&b, "HealBot  Хил:%s Бафы:%s\n", hs, bs)
-	fmt.Fprintf(&b, "Mana: %d/%d (%.0f%%)\n", st.Mana, st.ManaMax, st.ManaPct())
-	b.WriteString("HP:")
-	sep := ""
-	now := time.Now()
-	for _, u := range st.Units {
-		m := ""
-		if now.Before(hot[u.ID]) {
-			m = "*"
-		}
-		fmt.Fprintf(&b, "%s %s%s %d/%d (%.0f%%)", sep, m, u.ID, u.HP, u.Max, u.Pct())
-		sep = "\n    "
-	}
-	b.WriteString("\nКаст: " + lastCastLine)
-	if len(casts) > 0 {
-		b.WriteString("\nКасты:")
-		for id, n := range casts {
-			if n > 0 {
-				fmt.Fprintf(&b, " %s=%d", spellNames[id], n)
-			}
-		}
-	}
-	return b.String()
 }
 
 func lowest(units []game.Unit) *game.Unit {
