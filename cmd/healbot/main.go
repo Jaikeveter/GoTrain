@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"gotrain/internal/game"
@@ -23,8 +24,12 @@ const (
 	swiftmend  = 18562
 	motwID     = 1126
 	thornsID   = 467
+	barkID     = 22812
+	treeID     = 33891
 
 	rejuvDur = 12 * time.Second
+
+	treeForm = 6
 )
 
 var spellNames = map[int]string{
@@ -35,6 +40,8 @@ var spellNames = map[int]string{
 	swiftmend:  "Swiftmend",
 	motwID:     "Mark of the Wild",
 	thornsID:   "Thorns",
+	barkID:     "Barkskin",
+	treeID:     "Tree of Life",
 }
 
 var buffIDs = []int{motwID, thornsID}
@@ -47,6 +54,10 @@ func main() {
 	swiftPct := flag.Float64("swift", 45, "cast Swiftmend below this hp% (consumes HoT)")
 	hotCount := flag.Int("hotCount", 3, "max simultaneous Rejuvenation HoTs")
 	manaLow := flag.Float64("manaLow", 12, "cast Innervate below this mana%")
+	barkPct := flag.Float64("bark", 30, "cast Barkskin on self below this hp%")
+	trinketOn := flag.Bool("trinket", false, "auto-use trinkets (slots 13/14) during hard heals")
+	treeOn := flag.Bool("tree", false, "enter Tree of Life form when everyone is healthy")
+	stealthOn := flag.Bool("stealth", false, "hide console window and suppress status spam")
 	gcdF := flag.Duration("gcd", 1600*time.Millisecond, "global cast lock (client GCD is 1500ms)")
 	selftest := flag.Bool("selftest", false, "cast Rejuv/HT/Innervate once and report")
 	casttest := flag.Bool("casttest", false, "probe hardcast start: HT and Regrowth on self, trace casting state")
@@ -71,6 +82,9 @@ func main() {
 	fmt.Printf("healbot: hook ok (EndScene=0x%X)\n", h.Orig())
 	fmt.Printf("healbot: пороги hot<%.0f%% regrow<%.0f%% swift<%.0f%% flash<%.0f%% innervate<%.0f%% маны, лимит HoT=%d, лок каста %v\n",
 		*hotPct, *regrowPct, *swiftPct, *flashPct, *manaLow, *hotCount, *gcdF)
+	if *stealthOn {
+		hideConsole()
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
@@ -87,6 +101,9 @@ func main() {
 	uiInitAt := time.Now()
 	lastCastLine := ""
 	lastBuffCheck := time.Now()
+	casts := map[int]int{}
+	lastTrinket := time.Time{}
+	trinketSlot := 13
 
 	_ = game.UIInit(h)
 
@@ -102,6 +119,11 @@ func main() {
 		select {
 		case <-ctx.Done():
 			fmt.Println("\nbye")
+			for id, n := range casts {
+				if n > 0 {
+					fmt.Printf("кастов %s: %d\n", spellNames[id], n)
+				}
+			}
 			return
 		default:
 		}
@@ -125,7 +147,9 @@ func main() {
 		}
 		lastErr = nil
 		if time.Since(lastStatus) > 2*time.Second {
-			fmt.Println(st.String())
+			if !*stealthOn {
+				fmt.Println(st.String())
+			}
 			lastStatus = time.Now()
 		}
 
@@ -143,7 +167,7 @@ func main() {
 		if uiInited && time.Since(lastUI) > 500*time.Millisecond {
 			uiOn, uiBuff, _ = game.UIState(h)
 			lastUI = time.Now()
-			_ = game.UIUpdate(h, makeUI(st, lastCastLine, uiOn, uiBuff))
+			_ = game.UIUpdate(h, makeUI(st, lastCastLine, uiOn, uiBuff, hotUntil, casts))
 		}
 
 		if !uiOn && !uiBuff {
@@ -155,7 +179,7 @@ func main() {
 			time.Sleep(*tick)
 			continue
 		}
-		if st.Form != 0 {
+		if st.Form != 0 && !(*treeOn && st.Form == treeForm) {
 			_ = h.Do(`CancelShapeshiftForm()`)
 			fmt.Printf("%s выхожу из формы %d\n", ts(), st.Form)
 			time.Sleep(*tick)
@@ -169,6 +193,7 @@ func main() {
 			}
 			if cast(h, "player", innervate, &lastCast, 0, false) {
 				lastCastLine = "Innervate -> player"
+				casts[innervate]++
 			} else {
 				skippedUntil[innervate] = now.Add(10 * time.Minute)
 			}
@@ -199,6 +224,12 @@ func main() {
 						continue
 					}
 					hard := spell == htID || spell == regrowthID
+					if hard && *trinketOn && time.Since(lastTrinket) > 60*time.Second {
+						if err := h.Do(fmt.Sprintf("UseInventoryItem(%d)", trinketSlot)); err == nil {
+							lastTrinket = now
+							trinketSlot = 15 - trinketSlot
+						}
+					}
 					if cast(h, best.ID, spell, &lastCast, int(pct), hard) {
 						if spell == rejuvID {
 							hotUntil[best.ID] = now.Add(rejuvDur)
@@ -207,11 +238,39 @@ func main() {
 							delete(hotUntil, best.ID)
 						}
 						lastCastLine = fmt.Sprintf("%s -> %s (hp %d%%)", spellNames[spell], best.ID, int(pct))
+						casts[spell]++
 						didCast = true
 					} else {
 						skippedUntil[spell] = now.Add(10 * time.Minute)
 					}
 				}
+			}
+
+			if !didCast {
+				self := unitByID(st.Units, "player")
+				if self != nil && self.Pct() < *barkPct && now.Sub(lastCast) > *gcdF {
+					if v, ok := skippedUntil[barkID]; ok && now.Before(v) {
+						didCast = false
+					} else if castBuff(h, "player", barkID, &lastCast) {
+						lastCastLine = "Barkskin -> player"
+						casts[barkID]++
+						didCast = true
+					} else {
+						skippedUntil[barkID] = now.Add(10 * time.Minute)
+					}
+				}
+			}
+		}
+
+		if !didCast && *treeOn && st.Form == 0 && allHealthy(st.Units, *hotPct) && now.Sub(lastCast) > *gcdF {
+			if v, ok := skippedUntil[treeID]; ok && now.Before(v) {
+				// пропуск
+			} else if cast(h, "player", treeID, &lastCast, -1, false) {
+				lastCastLine = "Tree of Life"
+				casts[treeID]++
+				didCast = true
+			} else {
+				skippedUntil[treeID] = now.Add(10 * time.Minute)
 			}
 		}
 
@@ -227,6 +286,7 @@ func main() {
 				}
 				if cast(h, units[0], id, &lastCast, -1, false) {
 					lastCastLine = spellNames[id] + " -> " + units[0]
+					casts[id]++
 				} else {
 					skippedUntil[id] = now.Add(10 * time.Minute)
 				}
@@ -235,6 +295,24 @@ func main() {
 		}
 		time.Sleep(*tick)
 	}
+}
+
+func allHealthy(units []game.Unit, hotPct float64) bool {
+	for _, u := range units {
+		if u.Pct() < hotPct {
+			return false
+		}
+	}
+	return true
+}
+
+func unitByID(units []game.Unit, id string) *game.Unit {
+	for i := range units {
+		if units[i].ID == id {
+			return &units[i]
+		}
+	}
+	return nil
 }
 
 func hotBudgetOK(m map[string]time.Time, cap int) bool {
@@ -247,7 +325,7 @@ func hotBudgetOK(m map[string]time.Time, cap int) bool {
 	return n < cap
 }
 
-func makeUI(st *game.State, lastCastLine string, on, buff bool) string {
+func makeUI(st *game.State, lastCastLine string, on, buff bool, hot map[string]time.Time, casts map[int]int) string {
 	var b strings.Builder
 	hs := "ON"
 	if !on {
@@ -261,11 +339,24 @@ func makeUI(st *game.State, lastCastLine string, on, buff bool) string {
 	fmt.Fprintf(&b, "Mana: %d/%d (%.0f%%)\n", st.Mana, st.ManaMax, st.ManaPct())
 	b.WriteString("HP:")
 	sep := ""
+	now := time.Now()
 	for _, u := range st.Units {
-		fmt.Fprintf(&b, "%s %s %d/%d (%.0f%%)", sep, u.ID, u.HP, u.Max, u.Pct())
+		m := ""
+		if now.Before(hot[u.ID]) {
+			m = "*"
+		}
+		fmt.Fprintf(&b, "%s %s%s %d/%d (%.0f%%)", sep, m, u.ID, u.HP, u.Max, u.Pct())
 		sep = "\n    "
 	}
 	b.WriteString("\nКаст: " + lastCastLine)
+	if len(casts) > 0 {
+		b.WriteString("\nКасты:")
+		for id, n := range casts {
+			if n > 0 {
+				fmt.Fprintf(&b, " %s=%d", spellNames[id], n)
+			}
+		}
+	}
 	return b.String()
 }
 
@@ -460,6 +551,38 @@ func cast(h *hook.Hook, unit string, spellID int, lastCast *time.Time, pct int, 
 
 func castCode(id int) string {
 	return fmt.Sprintf(`local __n = GetSpellInfo(%d) if __n then CastSpellByName(__n) end`, id)
+}
+
+// castBuff кастует мгновенный бафф-дефенсив и проверяет появление по иконке.
+func castBuff(h *hook.Hook, unit string, spellID int, lastCast *time.Time) bool {
+	name := spellNames[spellID]
+	if err := h.Do(`TargetUnit("` + unit + `")`); err != nil {
+		fmt.Printf("%s target %s: %v\n", ts(), unit, err)
+		return false
+	}
+	if err := h.Do(castCode(spellID)); err != nil {
+		fmt.Printf("%s cast %s: %v\n", ts(), name, err)
+		return false
+	}
+	time.Sleep(700 * time.Millisecond)
+	*lastCast = time.Now()
+	ok, _ := game.UnitHasBuff(h, unit, spellID)
+	if !ok {
+		fmt.Printf("%s %s -> %s: НЕ ВЫУЧЕН (баф не появился)\n", ts(), name, unit)
+		return false
+	}
+	fmt.Printf("%s %s -> %s\n", ts(), name, unit)
+	return true
+}
+
+func hideConsole() {
+	kc := syscall.NewLazyDLL("kernel32.dll")
+	uc := syscall.NewLazyDLL("user32.dll")
+	hwnd, _, _ := kc.NewProc("GetConsoleWindow").Call()
+	if hwnd == 0 {
+		return
+	}
+	uc.NewProc("ShowWindow").Call(hwnd, 0)
 }
 
 func ts() string {

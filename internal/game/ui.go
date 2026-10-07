@@ -31,7 +31,11 @@ GT_UI_INIT = function()
   local healf=CreateFrame("CheckButton",nil,f,"UICheckButtonTemplate")
   healf:SetSize(24,24)
   healf:SetPoint("TOPLEFT",10,-8)
-  healf:SetScript("OnClick",function(self) GT_ON=self:GetChecked() end)
+  healf:SetHitRectInsets(0,-70,0,0)
+  healf:SetScript("OnClick",function(self)
+    GT_ON=not GT_ON
+    self:SetChecked(GT_ON==true)
+  end)
   local hl=healf:CreateFontString(nil,"OVERLAY","GameFontNormal")
   hl:SetPoint("LEFT",healf,"RIGHT",4,0)
   hl:SetText("Хил")
@@ -39,7 +43,11 @@ GT_UI_INIT = function()
   local bufff=CreateFrame("CheckButton",nil,f,"UICheckButtonTemplate")
   bufff:SetSize(24,24)
   bufff:SetPoint("LEFT",healf,"RIGHT",80,0)
-  bufff:SetScript("OnClick",function(self) GT_BUFF=self:GetChecked() end)
+  bufff:SetHitRectInsets(0,-60,0,0)
+  bufff:SetScript("OnClick",function(self)
+    GT_BUFF=not GT_BUFF
+    self:SetChecked(GT_BUFF==true)
+  end)
   local bl=bufff:CreateFontString(nil,"OVERLAY","GameFontNormal")
   bl:SetPoint("LEFT",bufff,"RIGHT",4,0)
   bl:SetText("Бафы")
@@ -51,6 +59,8 @@ GT_UI_INIT = function()
   t:SetJustifyV("TOP")
   f.text=t
   GT_UI_frame=f
+  GT_heal=healf
+  GT_buff=bufff
   GT_ON=true
   GT_BUFF=true
   GT_LASTUP=GetTime()
@@ -64,9 +74,9 @@ end
 GT_UI_INIT()
 `
 
-// UIDestroy убирает фрейм из клиента.
+// UIDestroy убирает фрейм и чекбоксы из клиента.
 func UIDestroy(h *hook.Hook) error {
-	return h.Do(`if GT_UI_frame then GT_UI_frame:Hide() GT_UI_frame:SetParent(nil) GT_UI_frame=nil end`)
+	return h.Do(`if GT_UI_frame then GT_UI_frame:Hide() GT_UI_frame:SetParent(nil) GT_UI_frame=nil end GT_heal=nil GT_buff=nil`)
 }
 
 // UIInit создаёт окно с чекбоксами в игре (идемпотентно).
@@ -74,9 +84,34 @@ func UIInit(h *hook.Hook) error {
 	return h.Do(uiInitLua)
 }
 
-// UIUpdate обновляет текст фрейма и отмечает факт работы бота.
+// UIUpdate синхронизирует чекбоксы с переменными и обновляет текст фрейма.
 func UIUpdate(h *hook.Hook, text string) error {
-	return h.Do(fmt.Sprintf("GT_LASTUP=GetTime() GT_TXT=[==[%s]==] local f=GT_UI_frame if f then f.text:SetText(GT_TXT) end", text))
+	return h.Do(fmt.Sprintf(`GT_LASTUP=GetTime() if GT_heal then GT_heal:SetChecked(GT_ON==true) end if GT_buff then GT_buff:SetChecked(GT_BUFF==true) end GT_TXT=[==[%s]==] local f=GT_UI_frame if f then f.text:SetText(GT_TXT) end`, text))
+}
+
+// UnitHasBuff проверяет наличие бафа по иконке спелла на юните.
+func UnitHasBuff(h *hook.Hook, unit string, spellID int) (bool, error) {
+	code := fmt.Sprintf(`GT_V=(function(spellID)
+  local _,_,icon=GetSpellInfo(spellID)
+  if not icon then return "true" end
+  local ok,v=pcall(function()
+    for i=1,32 do
+      local _,_,tex=UnitBuff(%q,i)
+      if tex and tex==icon then return true end
+    end
+    return false
+  end)
+  if not ok then return "true" end
+  return tostring(v)
+end)(%d)`, unit, spellID)
+	if err := h.Do(code); err != nil {
+		return false, err
+	}
+	v, err := h.Get("GT_V")
+	if err != nil {
+		return false, err
+	}
+	return v == "true", nil
 }
 
 // UIState возвращает состояние чекбоксов (Хил, Бафы).
