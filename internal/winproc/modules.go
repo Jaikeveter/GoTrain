@@ -25,7 +25,15 @@ var (
 	procGetModuleFileNameExW = psapi.NewProc("GetModuleFileNameExW")
 )
 
+// Modules перечисляет модули процесса: сначала psapi, при неудаче — Toolhelp32.
 func (p *Process) Modules() ([]Module, error) {
+	if mods, err := p.modulesPsapi(); err == nil && len(mods) > 0 {
+		return mods, nil
+	}
+	return p.modulesToolhelp()
+}
+
+func (p *Process) modulesPsapi() ([]Module, error) {
 	var needed uint32
 	buf := make([]windows.Handle, 256)
 	r1, _, err := procEnumProcessModules.Call(
@@ -56,6 +64,31 @@ func (p *Process) Modules() ([]Module, error) {
 			name = windows.UTF16ToString(nameBuf[:int(ln)])
 		}
 		out = append(out, Module{Base: mi.lpBaseOfDll, Size: mi.SizeOfImage, Name: name})
+	}
+	return out, nil
+}
+
+// modulesToolhelp может сработать там, где psapi запрещён.
+func (p *Process) modulesToolhelp() ([]Module, error) {
+	flags := uint32(windows.TH32CS_SNAPMODULE | windows.TH32CS_SNAPMODULE32)
+	snap, err := windows.CreateToolhelp32Snapshot(flags, p.Pid)
+	if err != nil {
+		return nil, fmt.Errorf("CreateToolhelp32Snapshot: %w", err)
+	}
+	defer windows.CloseHandle(snap)
+	var me windows.ModuleEntry32
+	me.Size = uint32(unsafe.Sizeof(me))
+	var out []Module
+	err = windows.Module32First(snap, &me)
+	for err == nil {
+		name := windows.UTF16ToString(me.Module[:])
+		base := uintptr(me.ModBaseAddr)
+		out = append(out, Module{
+			Base: base,
+			Size: me.ModBaseSize,
+			Name: name,
+		})
+		err = windows.Module32Next(snap, &me)
 	}
 	return out, nil
 }

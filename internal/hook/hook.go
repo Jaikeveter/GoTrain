@@ -148,23 +148,37 @@ type Hook struct {
 }
 
 func Install(p *winproc.Process) (*Hook, error) {
-	cands, err := Resolve(p)
-	if err != nil {
-		return nil, err
-	}
-	mods, modErr := p.Modules()
+	mods, _ := p.Modules()
 	var best *Candidate
 	bestScore := 0
-	for i := range cands {
-		s := Score(cands[i], mods)
-		if s > bestScore {
-			best = &cands[i]
-			bestScore = s
+	var lastCands []Candidate
+	var resolveErr error
+	var modErr error
+
+	for attempt := 0; attempt < 10; attempt++ {
+		cands, err := Resolve(p)
+		lastCands = cands
+		resolveErr = err
+		if err == nil {
+			if mods == nil {
+				mods, modErr = p.Modules()
+			}
+			for i := range cands {
+				s := Score(cands[i], mods)
+				if s > bestScore {
+					best = &cands[i]
+					bestScore = s
+				}
+			}
+			if best != nil && bestScore > 0 {
+				break
+			}
 		}
+		time.Sleep(300 * time.Millisecond)
 	}
 	if best == nil || bestScore == 0 {
-		return nil, fmt.Errorf("vtable не прошла валидацию (модули: %v); candidates: %s",
-			modErr, summarize(cands, mods))
+		return nil, fmt.Errorf("vtable не прошла валидацию (модули: %v); candidates: %s (resolve=%v) — клиент ещё грузит d3d или окно свёрнуто?",
+			modErr, summarize(lastCands, mods), resolveErr)
 	}
 
 	mem, err := p.Alloc(totalSize)
@@ -361,18 +375,29 @@ func (h *Hook) writeU32(off uintptr, v uint32) error {
 }
 
 func (h *Hook) patchSlot(addr, val uintptr) error {
-	old, err := h.p.Protect(addr, 4, pageRWX)
+	return patchSlotAddr(h.p, addr, val)
+}
+
+func patchSlotAddr(p *winproc.Process, addr, val uintptr) error {
+	old, err := p.Protect(addr, 4, pageRWX)
 	if err != nil {
 		return fmt.Errorf("vtable protect: %w", err)
 	}
-	if err := h.p.Write(addr, u32bytes(u32(val))); err != nil {
-		h.p.Protect(addr, 4, old)
+	if err := p.Write(addr, u32bytes(u32(val))); err != nil {
+		p.Protect(addr, 4, old)
 		return fmt.Errorf("vtable write: %w", err)
 	}
-	if _, err := h.p.Protect(addr, 4, old); err != nil {
+	if _, err := p.Protect(addr, 4, old); err != nil {
 		return fmt.Errorf("vtable restore protect: %w", err)
 	}
 	return nil
+}
+
+// Snapshot возвращает копии патченых слотов для сохранения состояния.
+func (h *Hook) Snapshot() (slots, origs, ents []uintptr) {
+	return append([]uintptr{}, h.slots...),
+		append([]uintptr{}, h.origs...),
+		append([]uintptr{}, h.entries...)
 }
 
 func summarize(cands []Candidate, mods []winproc.Module) string {

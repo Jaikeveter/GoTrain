@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -46,6 +47,32 @@ var spellNames = map[int]string{
 
 var buffIDs = []int{motwID, thornsID}
 
+var hookStop = make(chan struct{})
+var hookStopOnce sync.Once
+
+func ctrlHandler(ctrlType uintptr) uintptr {
+	switch ctrlType {
+	case 0, 1, 2, 5, 6: // CTRL_C, CTRL_BREAK, CTRL_CLOSE, CTRL_LOGOFF, CTRL_SHUTDOWN
+		hookStopOnce.Do(func() { close(hookStop) })
+		return 1
+	}
+	return 0
+}
+
+func setupConsoleClose() {
+	k32 := syscall.NewLazyDLL("kernel32.dll")
+	k32.NewProc("SetConsoleCtrlHandler").Call(syscall.NewCallback(ctrlHandler), 1)
+}
+
+func printCastStats(casts map[int]int) {
+	fmt.Println("\nbye")
+	for id, n := range casts {
+		if n > 0 {
+			fmt.Printf("кастов %s: %d\n", spellNames[id], n)
+		}
+	}
+}
+
 func main() {
 	tick := flag.Duration("tick", 100*time.Millisecond, "decision tick")
 	hotPct := flag.Float64("hot", 75, "cast Rejuvenation below this hp%")
@@ -61,23 +88,40 @@ func main() {
 	gcdF := flag.Duration("gcd", 1600*time.Millisecond, "global cast lock (client GCD is 1500ms)")
 	selftest := flag.Bool("selftest", false, "cast Rejuv/HT/Innervate once and report")
 	casttest := flag.Bool("casttest", false, "probe hardcast start: HT and Regrowth on self, trace casting state")
+	pidF := flag.Int("pid", 0, "WoW process id (default: first Wow.exe found)")
 	flag.Parse()
 
 	pid, err := winproc.Find("Wow.exe")
 	if err != nil {
 		fail("%v", err)
 	}
+	if *pidF > 0 {
+		pid = uint32(*pidF)
+	}
+	fmt.Printf("healbot: Wow pid=%d (если клиентов несколько — запусти с -pid)\n", pid)
 	p, err := winproc.Open(pid)
 	if err != nil {
 		fail("%v", err)
 	}
 	defer p.Close()
 
+	if err := hook.RestoreStale(p); err != nil {
+		fmt.Printf("healbot: восстановление vtable: %v\n", err)
+	}
+	if msg := hook.RepairedCaves(p); msg != "" {
+		fmt.Println("healbot: восстановлен vtable:", msg)
+	}
+
 	h, err := hook.Install(p)
 	if err != nil {
 		fail("hook: %v", err)
 	}
-	defer h.Uninstall()
+	slots, origs, ents := h.Snapshot()
+	_ = hook.SaveState(pid, slots, origs, ents)
+	defer func() {
+		hook.ClearState(pid)
+		_ = h.Uninstall()
+	}()
 	defer game.UIDestroy(h)
 	fmt.Printf("healbot: hook ok (EndScene=0x%X)\n", h.Orig())
 	fmt.Printf("healbot: пороги hot<%.0f%% regrow<%.0f%% swift<%.0f%% flash<%.0f%% innervate<%.0f%% маны, лимит HoT=%d, лок каста %v\n",
@@ -88,6 +132,7 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
+	setupConsoleClose()
 
 	f0, _ := h.Frames()
 	lastCast := time.Now()
@@ -118,12 +163,10 @@ func main() {
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Println("\nbye")
-			for id, n := range casts {
-				if n > 0 {
-					fmt.Printf("кастов %s: %d\n", spellNames[id], n)
-				}
-			}
+			printCastStats(casts)
+			return
+		case <-hookStop:
+			printCastStats(casts)
 			return
 		default:
 		}
